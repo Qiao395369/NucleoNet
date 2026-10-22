@@ -1,0 +1,6 @@
+include README.md THIRD_PARTY_NOTICES.md
+include LICENSE
+recursive-include LICENSES *.txt
+recursive-include tests *.py *.md *.ini .gitignore
+prune tests/.artifacts
+global-exclude __pycache__ *.py[cod] .DS_Store

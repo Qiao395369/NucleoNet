@@ -1,0 +1,15 @@
+test_envelope/
+results/
+envelope_analysis/
+ckpt/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+build/
+dist/
+logs/
+.DS_Store
+

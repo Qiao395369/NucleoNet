@@ -1,0 +1,985 @@
+"""Entry points for running standard jobs."""
+
+import datetime
+import functools
+import logging
+import os
+import subprocess
+from typing import Any, Optional, Tuple, Union
+import math
+import chex
+import flax
+import jax
+import jax.numpy as jnp
+import numpy as np
+from absl import flags
+from ml_collections import ConfigDict
+import vmcnet.utils as utils
+import vmcnet.mcmc as mcmc
+import vmcnet.mcmc.dynamic_width_position_amplitude as dwpa
+import vmcnet.mcmc.position_amplitude_core as pacore
+import vmcnet.physics as physics
+import vmcnet.train as train
+import vmcnet.updates as updates
+import vmcnet.utils as utils
+import vmcnet.lapnet_.system as system
+import vmcnet.train.pretrain_hf as pretrain
+from vmcnet.utils.typing import (
+    Array,
+    P,
+    ClippingFn,
+    PRNGKey,
+    D,
+    S,
+    GetPositionFromData,
+    GetAmplitudeFromData,
+    LocalEnergyApply,
+    ModelApply,
+    OptimizerState,
+)
+
+FLAGS = flags.FLAGS
+import sys
+import time
+
+import logging
+
+def create_hf_data(ion_pos, symbol, nspins):
+    """
+    ion_pos:(W,natoms,dim)
+    symbol:["x", "x", ...] total n=natoms strings
+    """
+    multi_walker_list = []
+    walker_num, natoms, _= ion_pos.shape
+    assert len(symbol) == natoms
+    for i in range(walker_num):
+        single_walker_list = []
+        for j in range(natoms):
+            single_atom_data = system.Atom(symbol[j], ion_pos[i][j]) 
+            single_walker_list.append(single_atom_data)
+        multi_walker_list.append(single_walker_list)
+
+    hartree_focks = []
+    for single_walker_data in multi_walker_list:
+        hartree_fock = pretrain.get_hf(
+            pyscf_mol = None,
+            molecule = single_walker_data,
+            nspins = nspins,
+            restricted = False,
+            basis = "ccpvdz",
+        )
+        hartree_focks.append(hartree_fock)
+
+    hf_novmaps = []
+    for hartree_fock in hartree_focks:
+        hf_novmap = pretrain.make_HF_ansatz(hartree_fock)
+        hf_novmaps.append(hf_novmap)
+    return hartree_focks, hf_novmaps
+
+def show_devices():
+    devices = jax.devices()
+    local_n = jax.local_device_count()
+    backend = jax.default_backend()  # "gpu" / "tpu" / "cpu"
+    logging.info(
+        "Devices=%s\n " \
+        "         JAX backend=%s\n " \
+        "         process_count=%d\n" \
+        "          local_device_count=%d\n" \
+        "          global_device_count=%d",
+        devices, backend, jax.process_count(), local_n, jax.device_count()
+    )
+
+
+def _get_logdir_and_save_config(reload_config: ConfigDict, config: ConfigDict,infer:bool) -> str:
+    if infer:
+        name="infer"
+        if config.subfolder_name != train.default_config.NO_NAME:
+            config.logdir = os.path.join(config.logdir, config.subfolder_name)
+        if config.save_to_current_datetime_subfolder:
+            config.logdir = os.path.join(
+                config.logdir, datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            )
+        config.logdir = utils.io.add_suffix_for_uniqueness(config.logdir)
+    else:
+        name="reload"
+        if reload_config.same_logdir:
+            config.logdir = reload_config.logdir
+        else:
+            if config.subfolder_name != train.default_config.NO_NAME:
+                config.logdir = os.path.join(config.logdir, config.subfolder_name)
+            if config.save_to_current_datetime_subfolder:
+                config.logdir = os.path.join(config.logdir, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+            config.logdir = utils.io.add_suffix_for_uniqueness(config.logdir)
+    utils.io.save_config_dict_to_json(config, config.logdir, "config")
+    utils.io.save_config_dict_to_json(reload_config, config.logdir, name+"_config")
+    logging.info("%s configuration  : %s\n" \
+    "          Run with configuration: %s", name, config.logdir+"/"+name+"_config.json", config.logdir+"/"+"config.json")
+    return config.logdir
+
+
+def _get_dtype(config: ConfigDict):
+    if config.dtype == "float32":
+        jax.config.update("jax_enable_x64", False)
+        return jnp.float32
+    elif config.dtype == "float64":
+        jax.config.update("jax_enable_x64", True)
+        return jnp.float64
+
+    raise ValueError(
+        "dtype other than float32, float64 not supported; {} was requested".format(config.dtype)
+    )
+
+
+def _get_electron_ion_config_as_arrays(
+    config: ConfigDict, dtype=jnp.float32, repeat_single_molecule=False, repeat_single_molecule_walker=4,
+) -> Tuple[Array, Array, Array]:
+    ion_pos = jnp.array(config.ion_pos, dtype=dtype)
+    if len(ion_pos.shape)==2:
+        ion_pos=ion_pos[None,:]
+
+    if repeat_single_molecule:
+        if ion_pos.shape[0]==1:
+            ion_pos=jnp.repeat(ion_pos,repeat_single_molecule_walker,axis=0)
+        else:
+            RuntimeError("repeat_single_molecule is only valid for single-molecule walkers")
+    
+    ion_charges = jnp.array(config.ion_charges, dtype=dtype)
+    single_nspins=jnp.array(config.single_nspins,dtype=int)
+    nelec = jnp.array(config.nspins)
+    nspins=config.nspins
+    # logging.info(f"initial_ion_positions:{ion_pos.shape}")
+    return ion_pos, ion_charges, nelec, nspins, single_nspins
+
+
+def _get_gaoqiao_model(
+        config_gq,
+        nelec,
+        charges,
+        nspins,
+        key,
+        apply_pmap
+):
+    import vmcnet.gaoqiao.build as gaoqiaobuild
+    key, subkey = jax.random.split(key)
+
+    feat_params = {
+        "do_act": config_gq.feat_do_act,
+        "act_func": config_gq.feat_act_func,
+        "numb_divid": config_gq.feat_numb_divid,
+        "scale": config_gq.scale if config_gq.scale != 1.0 else [],
+        "rescale": config_gq.rescale_input,
+    }
+
+    params, network_wfn, det_fn, orb_fn , _= gaoqiaobuild.build_network(           #orbitals
+        n=nelec,  #电子个数
+        charges=charges,  #i.e. charges=jnp.asarray([7.,7.])
+        nspins=nspins,   #i.e. (7,7)
+        key=key, 
+        ndet=config_gq.ndet,  
+        depth=config_gq.wfn_depth, 
+        h1=config_gq.h1, 
+        h2=config_gq.h2, 
+        nh=config_gq.nh,
+        do_complex=config_gq.do_complex,
+        gq_type=config_gq.type,
+        envelope_type=config_gq.envelope_type,
+        feat_params=feat_params,
+        det_mode=config_gq.det_mode, 
+        jastrow_type=config_gq.jastrow_type,
+        jastrow_mlp_nlayer=config_gq.jastrow_mlp_nlayer,
+        jastrow_mlp_ndim=config_gq.jastrow_mlp_ndim,
+        activation_type=config_gq.activation_type,
+        jastrow_activation_type=config_gq.jastrow_activation_type,
+        dp_type=config_gq.dp_type,
+    )        
+
+    if apply_pmap:
+        params = utils.distribute.replicate_all_local_devices(params)
+
+    def log_psi_apply_novmap(params,xp,xe):
+        _, logabsdet = network_wfn(params,xe,xp) #xe(ne,3),xp(na,3)
+        return logabsdet
+
+    def log_psi_apply_vmap_two_dim(params, xp, xe):
+        return jax.vmap(jax.vmap(log_psi_apply_novmap, in_axes=(None, None, 0)), in_axes=(None, 0, 0))(params, xp, xe)
+        
+    def log_psi_apply_vmap_one_dim(params, xp, xe):
+        return jax.vmap(log_psi_apply_novmap, in_axes=(None, None, 0))(params, xp, xe)
+
+    def det_fn_novmap(params,xp,xe):
+        det = det_fn(params,xe,xp) #xe(ne,3),xp(na,3)
+        return det
+    
+    det_fn_vmap = jax.vmap(jax.vmap(det_fn_novmap, in_axes=(None, None, 0)), in_axes=(None, 0, 0))
+    def orb_fn_novmap(params,xp,xe):
+        orb = orb_fn(params,xe,xp)[0] #xe(ne,3),xp(na,3)
+        return orb
+    
+    orb_fn_vmap = jax.vmap(jax.vmap(orb_fn_novmap, in_axes=(None, None, 0)), in_axes=(None, 0, 0))
+
+    return log_psi_apply_vmap_two_dim, log_psi_apply_vmap_one_dim, log_psi_apply_novmap, det_fn_novmap, det_fn_vmap, orb_fn_vmap, params, key
+
+
+def _make_initial_distributed_data(
+    distributed_log_psi_apply: ModelApply[P],
+    run_config: ConfigDict,
+    ion_pos: Array,
+    init_pos: Array,
+    params: P,
+    dtype=jnp.float32,
+) -> dwpa.DWPAData:
+    # Need to use distributed_log_psi_apply here, in the case where there is not enough
+    # memory to form the initial amplitudes on a single device
+    sharded_ion_pos = utils.distribute.default_distribute_data(ion_pos)
+    sharded_init_pos = utils.distribute.default_distribute_data(init_pos)
+    sharded_amplitudes = distributed_log_psi_apply(params,sharded_ion_pos, sharded_init_pos)
+    W = sharded_init_pos.shape[1]
+    move_metadata = utils.distribute.replicate_all_local_devices(
+        dwpa.MoveMetadata(
+            std_move=jnp.full((W,), run_config.std_move, dtype=dtype),
+            move_acceptance_sum=jnp.full((W,), 0.0, dtype=dtype),
+            moves_since_update=jnp.full((W,), 0),
+        )
+    )
+    return pacore.make_position_amplitude_data(
+        sharded_ion_pos, sharded_init_pos, sharded_amplitudes, move_metadata
+    )
+
+
+def _make_initial_single_device_data(
+    log_psi_apply: ModelApply[P],
+    run_config: ConfigDict,
+    ion_pos: Array,
+    init_pos: Array,
+    params: P,
+    dtype=jnp.float32,
+) -> dwpa.DWPAData:
+    amplitudes = log_psi_apply(params, ion_pos, init_pos)
+    W = ion_pos.shape[0]
+    return dwpa.make_dynamic_width_position_amplitude_data(
+        ion_pos,
+        init_pos,
+        amplitudes,
+        std_move=jnp.full((W,), run_config.std_move, dtype=dtype),
+        move_acceptance_sum=jnp.full((W,), 0.0, dtype=dtype),
+        moves_since_update=jnp.full((W,), 0),
+    )
+
+
+def _make_initial_data(
+    log_psi_apply: ModelApply[P],
+    run_config: ConfigDict,
+    ion_pos: Array,
+    init_pos: Array,
+    params: P,
+    dtype=jnp.float32,
+    apply_pmap: bool = True,
+) -> dwpa.DWPAData:
+    if apply_pmap:
+        return _make_initial_distributed_data(
+            utils.distribute.pmap(log_psi_apply), run_config, ion_pos, init_pos, params, dtype
+        )
+    else:
+        return _make_initial_single_device_data(
+            log_psi_apply, run_config, ion_pos, init_pos, params, dtype
+        )
+
+
+# TODO: add threshold_adjust_std_move options to configs
+# TODO: add more options than just dwpa
+# TODO: remove dependence on exact field names
+def _get_mcmc_fns(
+    run_config: ConfigDict, log_psi_apply: ModelApply[P], apply_pmap: bool = True
+) -> Tuple[
+    mcmc.metropolis.BurningStep[P, dwpa.DWPAData],
+    mcmc.metropolis.WalkerFn[P, dwpa.DWPAData],
+]:
+    metrop_step_fn = dwpa.make_dynamic_pos_amp_gaussian_step(
+        log_psi_apply,
+        run_config.nmoves_per_width_update,
+        dwpa.make_threshold_adjust_std_move(0.5, 0.05, 0.1),
+    )
+    burning_step = mcmc.metropolis.make_jitted_burning_step(
+        metrop_step_fn, apply_pmap=apply_pmap
+    )
+    walker_fn = mcmc.metropolis.make_jitted_walker_fn(
+        run_config.nsteps_per_param_update, metrop_step_fn, apply_pmap=apply_pmap
+    )
+
+    return burning_step, walker_fn
+
+
+# TODO: figure out where this should go, perhaps in a physics/molecule.py file?
+def _assemble_mol_local_energy_fn(
+    ion_charges: Array,
+    ei_softening: chex.Scalar,
+    ee_softening: chex.Scalar,
+    log_psi_apply: ModelApply[P],
+    config_vmc,
+) :
+
+    kinetic_fn = physics.kinetic.create_laplacian_kinetic_energy_new(log_psi_apply, config_vmc.fwdlap_inner_size)
+    ei_potential_fn = physics.potential.create_electron_ion_coulomb_potential(
+        ion_charges, softening_term=ei_softening
+    )
+    ee_potential_fn = physics.potential.create_electron_electron_coulomb_potential(
+        softening_term=ee_softening
+    )
+    ii_potential_fn = physics.potential.create_ion_ion_coulomb_potential(
+        ion_charges
+    )
+    local_energy_fn = physics.core.combine_local_energy_terms([kinetic_fn,ei_potential_fn,ee_potential_fn,ii_potential_fn])
+    return local_energy_fn
+
+# TODO: figure out where this should go -- the act of clipping energies is kind of just
+# a training trick rather than a physics thing, so maybe this stays here
+def total_variation_clipping_fn(
+    local_energies: Array,
+    energy_noclip: chex.Numeric,
+    threshold=5.0,
+    clip_center="mean",
+) -> Array:
+    """Clip local es to within a multiple of the total variation from a center."""
+    if clip_center == "mean":
+        center = energy_noclip
+    elif clip_center == "median":
+        center = jnp.nanmedian(local_energies, axis=-1, keepdims=True)
+    else:
+        raise ValueError(
+            "Only mean and median are supported clipping centers, but {} was "
+            "requested".format(clip_center)
+        )
+    total_variation = jnp.nanmean(jnp.abs(local_energies - center), axis=-1, keepdims=True)
+    clipped_local_e = jnp.clip(
+        local_energies,
+        center - threshold * total_variation,
+        center + threshold * total_variation,
+    )
+    return clipped_local_e
+
+
+# TODO: possibly include other types of clipping functions? e.g. using std deviation
+# instead of total variation
+def _get_clipping_fn(
+    vmc_config: ConfigDict,
+) -> Optional[ClippingFn]:
+    clipping_fn = None
+    if vmc_config.clip_threshold > 0.0:
+        clipping_fn = functools.partial(
+            total_variation_clipping_fn,
+            threshold=vmc_config.clip_threshold,
+            clip_center=vmc_config.clip_center,
+        )
+    return clipping_fn
+
+
+# TODO: don't forget to update type hint to be more general when
+# _make_initial_distributed_data is more general
+def _setup_vmc(
+    config: ConfigDict,
+    ion_pos: Array,
+    ion_charges: Array,
+    nelec: Array,
+    nspins,
+    single_nspins,
+    key: PRNGKey,
+    dtype=jnp.float32,
+    apply_pmap: bool = True,
+    reload_from_checkpoint: bool = False,
+) -> Tuple[
+    ModelApply[flax.core.FrozenDict],
+    mcmc.metropolis.BurningStep[flax.core.FrozenDict, dwpa.DWPAData],
+    mcmc.metropolis.WalkerFn[flax.core.FrozenDict, dwpa.DWPAData],
+    updates.update_param_fns.UpdateParamFn[
+        flax.core.FrozenDict, dwpa.DWPAData, OptimizerState
+    ],
+    GetAmplitudeFromData[dwpa.DWPAData],
+    flax.core.FrozenDict,
+    dwpa.DWPAData,
+    OptimizerState,
+    PRNGKey,
+]:
+    nelec_total = int(jnp.sum(nelec))
+    key, init_pos = physics.core.initialize_molecular_pos(
+        key, 
+        config.vmc.nchains,
+        ion_pos, 
+        ion_charges, 
+        nelec_total, 
+        single_nspins,
+        config.vmc.init_width,
+        dtype=dtype
+    )   #init_pos:(W,B,ne,dim)
+
+    # Make the model
+    if config.wfn_type == "gaoqiao":
+        log_psi_apply_vmap_two_dim, log_psi_apply_vmap_one_dim, log_psi_apply, det_fn_novmap,det_fn_vmap,orb_fn_vmap, params, key =  _get_gaoqiao_model(
+        config_gq=config.gq,
+        nelec=nelec_total,
+        charges=ion_charges,
+        nspins=nspins,
+        key=key,
+        apply_pmap=apply_pmap,
+        )
+    else:
+        raise ValueError("unknown wfn_type: %s "%(config.wfn_type))
+    
+    get_amplitude_fn = pacore.get_amplitude_from_data
+    update_data_fn = pacore.get_update_data_fn(log_psi_apply_vmap_two_dim)
+
+    # Setup metropolis step
+    burning_step, walker_fn = _get_mcmc_fns(config.vmc, log_psi_apply_vmap_one_dim, apply_pmap=apply_pmap)
+    
+    local_energy_fn = _assemble_mol_local_energy_fn(
+        ion_charges,
+        config.problem.ei_softening,
+        config.problem.ee_softening,
+        log_psi_apply,
+        config.vmc,
+    )
+    clipping_fn = _get_clipping_fn(config.vmc)
+    energy_and_statistics_fn = physics.core.create_energy_and_statistics_fn(local_energy_fn, clipping_fn, config.vmc.nan_safe)
+
+    if not reload_from_checkpoint:
+        # Make initial data
+        data = _make_initial_data(
+            log_psi_apply_vmap_two_dim, config.vmc, ion_pos, init_pos, params, dtype=dtype, apply_pmap=apply_pmap
+        )
+        logging.info("data shapes: %s", jax.tree_util.tree_map(lambda x: getattr(x, "shape", None), data))
+    else:
+        data = None
+
+    # Setup parameter updates
+    if apply_pmap:
+        key = utils.distribute.make_different_rng_key_on_all_devices(key)
+
+    (   get_grad_and_E,
+        update_param_fn,
+        optimizer_state,
+        key,
+    ) = updates.parse_optimizer_config.initialize_optimizer(
+        log_psi_apply,
+        energy_and_statistics_fn,
+        config.vmc,
+        params,
+        update_data_fn,
+        key,
+        apply_pmap=apply_pmap,
+    )
+
+    return (
+        log_psi_apply_vmap_two_dim,
+        log_psi_apply_vmap_one_dim,
+        log_psi_apply,
+        orb_fn_vmap,
+        energy_and_statistics_fn,
+        burning_step,
+        walker_fn,
+        get_grad_and_E,
+        update_param_fn,
+        get_amplitude_fn,
+        update_data_fn,
+        params,
+        data,
+        optimizer_state,
+        key,
+    )
+
+
+# TODO: update output type hints when _get_mcmc_fns is made more general
+def _setup_eval(
+    config: ConfigDict,
+    ion_pos: Array,
+    ion_charges: Array,
+    log_psi_apply_vmap: ModelApply[P],
+    log_psi_apply: ModelApply[P],
+    get_position_fn: GetPositionFromData[dwpa.DWPAData],
+    apply_pmap: bool = True,
+) -> Tuple[
+    updates.update_param_fns.UpdateParamFn[P, dwpa.DWPAData, OptimizerState],
+    mcmc.metropolis.BurningStep[P, dwpa.DWPAData],
+    mcmc.metropolis.WalkerFn[P, dwpa.DWPAData],
+]:
+    problem_config=config.problem
+    eval_config=config.eval
+    ei_softening = problem_config.ei_softening
+    ee_softening = problem_config.ee_softening
+
+    local_energy_fn = _assemble_mol_local_energy_fn(
+        ion_charges,
+        ei_softening,
+        ee_softening,
+        log_psi_apply,
+        config.vmc,
+    )
+    eval_get_grad_and_E, eval_update_param_fn = updates.update_param_fns.construct_eval_update_param_fn(
+        local_energy_fn,
+        nan_safe=eval_config.nan_safe,
+        apply_pmap=apply_pmap,
+    )
+    eval_burning_step, eval_walker_fn = _get_mcmc_fns(
+        eval_config, log_psi_apply_vmap, apply_pmap=apply_pmap
+    )
+    return eval_get_grad_and_E, eval_update_param_fn, eval_burning_step, eval_walker_fn
+
+
+def _make_new_data_for_eval(
+    config: ConfigDict,
+    log_psi_apply: ModelApply[P],
+    params: P,
+    ion_pos: Array,
+    ion_charges: Array,
+    nelec: Array,
+    single_nspins: Array,
+    key: PRNGKey,
+    is_pmapped: bool,
+    dtype=jnp.float32,
+) -> Tuple[PRNGKey, dwpa.DWPAData]:
+    nelec_total = int(jnp.sum(nelec))
+    # grab the first key if distributed
+    if is_pmapped:
+        key = utils.distribute.get_first(key)
+
+    key, init_pos = physics.core.initialize_molecular_pos(
+        key,
+        config.eval.nchains,
+        ion_pos,
+        ion_charges,
+        nelec_total,
+        single_nspins,
+        config.eval.init_width,
+        dtype=dtype,
+    )
+
+    if is_pmapped:
+        key = utils.distribute.make_different_rng_key_on_all_devices(key)
+
+    data = _make_initial_data(
+        log_psi_apply,
+        config.eval,
+        ion_pos,
+        init_pos,
+        params,
+        dtype=dtype,
+        apply_pmap=is_pmapped,
+    )
+
+    return key, data
+
+def _make_new_data_for_reload(
+    config: ConfigDict,
+    reload_config: ConfigDict,
+    log_psi_apply: ModelApply[P],
+    params: P,
+    ion_pos: Array,
+    ion_charges: Array,
+    nelec: Array,
+    single_nspins: Array,
+    key: PRNGKey,
+    is_pmapped: bool,
+    dtype=jnp.float32,
+) -> Tuple[PRNGKey, dwpa.DWPAData]:
+    nelec_total = int(jnp.sum(nelec))
+    # grab the first key if distributed
+    if is_pmapped:
+        key = utils.distribute.get_first(key)
+
+    key, init_pos = physics.core.initialize_molecular_pos(
+        key,
+        reload_config.nchains,
+        ion_pos,
+        ion_charges,
+        nelec_total,
+        single_nspins,
+        config.vmc.init_width,
+        dtype=dtype,
+    )
+
+    if is_pmapped:
+        key = utils.distribute.make_different_rng_key_on_all_devices(key)
+
+    data = _make_initial_data(
+        log_psi_apply,
+        config.vmc,
+        ion_pos,
+        init_pos,
+        params,
+        dtype=dtype,
+        apply_pmap=is_pmapped,
+    )
+
+    return key, data
+
+
+def _burn_and_run_vmc(
+    config: ConfigDict,
+    logdir: str,
+    params: P,
+    optimizer_state: S,
+    data: D,
+    burning_step: mcmc.metropolis.BurningStep[P, D],
+    nburn: int,
+    walker_fn: mcmc.metropolis.WalkerFn[P, D],
+    get_grad_and_E,
+    update_param_fn: updates.update_param_fns.UpdateParamFn[P, D, S],
+    get_amplitude_fn: GetAmplitudeFromData[D],
+    key: PRNGKey,
+    is_eval: bool,
+    is_pmapped: bool,
+    skip_burn: bool = False,
+    start_epoch: int = 0,
+    end_epochs: int = 0,
+) -> Tuple[P, S, D, PRNGKey, bool]:
+    if not is_eval:
+        run_config = config.vmc
+        checkpoint_every = run_config.checkpoint_every
+        best_checkpoint_every = run_config.best_checkpoint_every
+        checkpoint_dir = run_config.checkpoint_dir
+        checkpoint_variance_scale = run_config.checkpoint_variance_scale
+        nhistory_max = run_config.nhistory_max
+        check_for_nans = run_config.check_for_nans
+        acc_steps = run_config.acc_steps
+    else:
+        run_config = config.eval
+        checkpoint_every = None
+        best_checkpoint_every = None
+        checkpoint_dir = ""
+        checkpoint_variance_scale = 0
+        nhistory_max = 0
+        check_for_nans = False
+        acc_steps = 1
+
+    if not skip_burn:
+        data, key = mcmc.metropolis.burn_data(burning_step, nburn, params, data, key, is_pmapped)
+    nchains = math.prod(data["atoms_position"].shape[:-2])
+    return train.vmc.vmc_loop(
+        params,
+        optimizer_state,
+        data,
+        nchains,
+        end_epochs,
+        walker_fn,
+        get_grad_and_E,
+        update_param_fn,
+        key,
+        logdir=logdir,
+        checkpoint_every=checkpoint_every,
+        best_checkpoint_every=best_checkpoint_every,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_variance_scale=checkpoint_variance_scale,
+        check_for_nans=check_for_nans,
+        record_amplitudes=run_config.record_amplitudes,
+        get_amplitude_fn=get_amplitude_fn,
+        nhistory_max=nhistory_max,
+        is_pmapped=is_pmapped,
+        start_epoch=start_epoch,
+        acc_steps=acc_steps,
+    )
+
+
+def _compute_and_save_energy_statistics(
+    local_energies_file_path: str, output_dir: str, output_filename: str,nchains:int ,walkers:int ,repeat_single_mol:bool, cut:int
+) -> None:
+    local_energies = np.loadtxt(local_energies_file_path)
+    eval_statistics = mcmc.statistics.get_stats_summary(local_energies,nchains,walkers,repeat_single_mol,cut)
+    utils.io.save_dict_to_json(
+        eval_statistics,
+        output_dir,
+        output_filename,
+    )
+
+import os
+def run_molecule() -> None:
+    """Run VMC on a molecule."""
+    if any(arg in ("--help", "-h") for arg in sys.argv[1:]):
+        print(
+            "Usage: vmc-molecule [--config.FIELD=VALUE] [--reload.FIELD=VALUE]\n"
+            "       python -m vmcnet.train.runners [flags]\n\n"
+            "Train and evaluate NucleoNet molecular wavefunctions.\n"
+            "  --presets.path=FILE                 Load a saved JSON configuration\n"
+            "  --config.logdir=PATH                Output root\n"
+            "  --config.vmc.nepochs=N              Number of VMC updates\n"
+            "  --config.pretrain.iterations=0      Disable HF pretraining\n"
+            "  --config.eval.nepochs=N             Fixed-parameter evaluation steps\n"
+            "  --reload.logdir=PATH                Restore a saved run\n"
+            "  --reload.checkpoint_relative_file_path=FILE\n"
+            "  --reload.end_epochs=N               Absolute training endpoint\n\n"
+            "See README.md for single-geometry and six-geometry N2 examples.\n"
+            "All settings are defined in vmcnet/train/default_config.py."
+        )
+        return
+    reload_config, config = train.parse_config_flags.parse_flags(FLAGS)
+    
+    reload_from_checkpoint = (
+        reload_config.logdir != train.default_config.NO_RELOAD_LOG_DIR
+        and reload_config.use_checkpoint_file
+    )
+
+    if reload_from_checkpoint:
+        config.notes = config.notes + " (reloaded from {}/{}{})".format(
+            reload_config.logdir,
+            reload_config.checkpoint_relative_file_path,
+            ", new optimizer state" if reload_config.new_optimizer_state else "",
+        )
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(config.logging_level)
+    logdir = _get_logdir_and_save_config(reload_config, config, False)
+
+    # show_devices()
+
+    apply_pmap = config.distribute or reload_config.to_pmap
+    dtype_to_use = _get_dtype(config)
+
+    ion_pos, ion_charges, nelec ,nspins, single_nspins= _get_electron_ion_config_as_arrays(
+        config.problem, 
+        dtype=dtype_to_use, 
+        repeat_single_molecule=config.vmc.repeat_single_mol ,
+        repeat_single_molecule_walker=config.vmc.repeat_single_molecule_walker
+    )
+
+    key = jax.random.PRNGKey(config.initial_seed)
+
+    (
+        log_psi_apply_vmap_two_dim,
+        log_psi_apply_vmap_one_dim,
+        log_psi_apply_novmap,
+        orb_fn_vmap,
+        energy_and_statistics_fn,
+        burning_step,
+        walker_fn,
+        get_grad_and_E,
+        update_param_fn,
+        get_amplitude_fn,
+        update_data_fn,
+        params,
+        data,
+        optimizer_state,
+        key,
+    ) = _setup_vmc(
+        config,
+        ion_pos,
+        ion_charges,
+        nelec,
+        nspins,
+        single_nspins,
+        key,
+        dtype=dtype_to_use,
+        apply_pmap=apply_pmap,
+        reload_from_checkpoint=reload_from_checkpoint,
+    )
+
+    start_epoch = 0
+    end_epochs = config.vmc.nepochs
+    nburn = config.vmc.nburn
+
+    if reload_from_checkpoint:
+        checkpoint_file_path = os.path.join(
+            reload_config.logdir, reload_config.checkpoint_relative_file_path
+        )
+        logging.info("Reloading from %s", checkpoint_file_path)
+
+        directory, filename = os.path.split(checkpoint_file_path)
+
+        (
+            reload_at_epoch,
+            data,
+            params,
+            reloaded_optimizer_state,
+            key,
+        ) = utils.io.reload_vmc_state(directory, filename)
+
+        if reload_config.append:
+            utils.io.copy_txt_stats(
+                reload_config.logdir, logdir, truncate=reload_at_epoch
+            )
+
+        if reload_config.to_pmap:
+            logging.info("pmap data and key")
+            key = utils.distribute.make_different_rng_key_on_all_devices(key)
+            data = utils.distribute.replicate_all_local_devices(data)
+            logging.info("pmap data and key complete")
+
+        if apply_pmap:
+            (
+                data,
+                params,
+                reloaded_optimizer_state,
+                key,
+            ) = utils.distribute.distribute_vmc_state_from_checkpoint(
+                data, params, reloaded_optimizer_state, key
+            )
+
+        if reload_config.new_data:
+            logging.info("creating new data for reload ...")
+            key, data = _make_new_data_for_reload(
+                config,
+                reload_config,
+                log_psi_apply_vmap_two_dim,
+                params,
+                ion_pos,
+                ion_charges,
+                nelec,
+                single_nspins,
+                key,
+                is_pmapped=apply_pmap,
+                dtype=dtype_to_use,
+            )
+
+        logging.info("data shapes: %s", jax.tree_util.tree_map(lambda x: getattr(x, "shape", None), data))
+
+        if not reload_config.new_optimizer_state:
+            optimizer_state = reloaded_optimizer_state
+            start_epoch = reload_at_epoch
+        
+        end_epochs = reload_config.end_epochs
+        nburn = reload_config.nburn
+        logging.info("start_epoch: %d, end_epochs: %d, nburn: %d", start_epoch, end_epochs, nburn)
+
+    logging.info("Saving to %s", logdir)
+    config_pretrain = config.pretrain
+    if config_pretrain.iterations > 0 and start_epoch == 0:
+        hartree_fock, hf_novmaps = create_hf_data(ion_pos, config.problem.atoms_symbol, nspins)
+        def hf_novmap(params,xp,xe):
+            del params, xp
+            result1 = [jnp.exp(2 * hf_novmap(xe)) for hf_novmap in hf_novmaps]
+            result1_jnp = jnp.array(result1)
+            result = 1/2 * jnp.log(jnp.mean(result1_jnp))
+            return result
+        coeff = config_pretrain.hf_coeff
+        if coeff == 0 :
+            hf_psi_mix = log_psi_apply_novmap
+            logging.info("use psi_net to sample.")
+        elif coeff == 1 :
+            hf_psi_mix = hf_novmap
+            logging.info("use hf_net to sample.")
+        else:
+            logging.info("use mix to sample.")
+            def hf_psi_mix(params,xp,xe):
+                hf = hf_novmap(params,xp,xe)
+                psi = log_psi_apply_novmap(params,xp,xe)
+                out = 0.5 * jax.scipy.special.logsumexp(
+                    jnp.array([jnp.log(coeff) + 2.0 * hf , jnp.log(1.0 - coeff) + 2.0 * psi,])
+                )
+                return out
+
+        sample_pretrain = jax.vmap(hf_psi_mix, in_axes=(None, None, 0))
+        pretrain_burn_step, pretrain_walker_fn = _get_mcmc_fns(config_pretrain, sample_pretrain, apply_pmap=apply_pmap)
+
+        params, data, key = pretrain.pretrain_hartree_fock(
+            params=params,
+            data=data,
+            net_orbitals_vmap=orb_fn_vmap,
+            energy_and_statistics_fn=energy_and_statistics_fn,
+            pretrain_walker_fn=pretrain_walker_fn,
+            pretrain_burn_step=pretrain_burn_step,
+            pretrain_nburn=config_pretrain.nburn,
+            update_data_fn=update_data_fn,
+            walker_fn=walker_fn,
+            burning_step=burning_step,
+            key=key,
+            nspins=nspins,
+            scf_approx=hartree_fock,
+            iterations=config_pretrain.iterations,
+            optim=config_pretrain.optim,
+            apply_pmap=apply_pmap,
+            loss_mode=config_pretrain.loss_mode,
+            eps=config_pretrain.eps,
+            offblock_lambda=config_pretrain.offblock_lambda,
+            )
+
+    params, optimizer_state, data, key, nans_detected = _burn_and_run_vmc(
+        config=config,
+        logdir=logdir,
+        params=params,
+        optimizer_state=optimizer_state,
+        data=data,
+        burning_step=burning_step,
+        nburn=nburn,
+        walker_fn=walker_fn,
+        get_grad_and_E=get_grad_and_E,
+        update_param_fn=update_param_fn,
+        get_amplitude_fn=get_amplitude_fn,
+        key=key,
+        is_eval=False,
+        is_pmapped=apply_pmap,
+        skip_burn=reload_from_checkpoint and not reload_config.reburn and not reload_config.new_data,
+        start_epoch=start_epoch,
+        end_epochs=end_epochs,
+    )
+
+    if nans_detected:
+        logging.info("VMC terminated due to Nans! Aborting.")
+        return
+    else:
+        logging.info("Completed VMC! Evaluating")
+
+    # TODO: integrate the stuff in mcmc/statistics and write out an evaluation summary
+    # (energy, var, overall mean acceptance ratio, std error, iac) to eval_logdir, post
+    # evaluation
+    eval_logdir = os.path.join(logdir, "eval")
+
+    ion_pos, ion_charges, nelec ,nspins,single_nspins= _get_electron_ion_config_as_arrays(
+        config.eval, 
+        dtype=dtype_to_use,
+        repeat_single_molecule=config.eval.repeat_single_mol,
+        repeat_single_molecule_walker=config.eval.repeat_single_molecule_walker,
+        )
+
+    eval_get_grad_and_E, eval_update_param_fn, eval_burning_step, eval_walker_fn = _setup_eval(
+        config,
+        ion_pos,
+        ion_charges,
+        log_psi_apply_vmap_one_dim,
+        log_psi_apply_novmap,
+        pacore.get_position_from_data,
+        apply_pmap=apply_pmap,
+    )
+
+    eval_and_vmc_nchains_match = config.vmc.nchains == config.eval.nchains
+    if not config.eval.use_data_from_training or not eval_and_vmc_nchains_match:
+        logging.info("creating new data ...")
+        key, data = _make_new_data_for_eval(
+            config,
+            log_psi_apply_vmap_two_dim,
+            params,
+            ion_pos,
+            ion_charges,
+            nelec,
+            single_nspins,
+            key,
+            is_pmapped=apply_pmap,
+            dtype=dtype_to_use,
+        )
+
+    _burn_and_run_vmc(
+        config=config,
+        logdir=eval_logdir,
+        params=params,
+        optimizer_state=optimizer_state,
+        data=data,
+        burning_step=eval_burning_step,
+        nburn=config.eval.nburn,
+        walker_fn=eval_walker_fn,
+        get_grad_and_E=eval_get_grad_and_E,
+        update_param_fn=eval_update_param_fn,
+        get_amplitude_fn=get_amplitude_fn,
+        key=key,
+        is_eval=True,
+        is_pmapped=apply_pmap,
+        end_epochs = config.eval.nepochs,
+    )
+    logging.info("Saving to %s", logdir)
+    # need to check for local_energy.txt because when config.eval.nepochs=0 the file is
+    # not created regardless of config.eval.record_local_energies
+    local_es_were_recorded = os.path.exists(
+        os.path.join(eval_logdir, "multi_energy.txt")
+    )
+    if config.eval.record_local_energies and local_es_were_recorded:
+        local_energies_filepath = os.path.join(eval_logdir, "multi_energy.txt")
+        _compute_and_save_energy_statistics(
+            local_energies_filepath, eval_logdir, "statistics", config.eval.nchains, ion_pos.shape[0], config.eval.repeat_single_mol,0
+        )
+
+if __name__ == "__main__":
+    run_molecule()
