@@ -1,0 +1,168 @@
+{
+    "notes": "default",
+    "problem": {
+        "ion_pos": [
+            [
+                [
+                    0.0,
+                    0.0,
+                    1.034
+                ],
+                [
+                    0.0,
+                    0.0,
+                    -1.034
+                ]
+            ]
+        ],
+        "ion_charges": [
+            7.0,
+            7.0
+        ],
+        "atoms_symbol": [
+            "N",
+            "N"
+        ],
+        "nspins": [
+            7,
+            7
+        ],
+        "single_nspins": [
+            [
+                5,
+                2
+            ],
+            [
+                2,
+                5
+            ]
+        ],
+        "ei_softening": 0.0,
+        "ee_softening": 0.0
+    },
+    "pretrain": {
+        "optim": "adam",
+        "nburn": 0,
+        "iterations": 4000,
+        "nsteps_per_param_update": 20,
+        "nmoves_per_width_update": 100,
+        "loss_mode": "fulldet",
+        "eps": 0.0001,
+        "offblock_lambda": 0.0,
+        "hf_coeff": 1
+    },
+    "vmc": {
+        "nchains": 4096,
+        "repeat_single_mol": false,
+        "repeat_single_molecule_walker": 2,
+        "acc_steps": 1,
+        "nepochs": 150000,
+        "nburn": 4000,
+        "fwdlap_inner_size": 42,
+        "nsteps_per_param_update": 40,
+        "nmoves_per_width_update": 100,
+        "std_move": 0.25,
+        "init_width": 0.5,
+        "checkpoint_every": 10000,
+        "best_checkpoint_every": 10000,
+        "checkpoint_dir": "checkpoints",
+        "checkpoint_variance_scale": 10,
+        "check_for_nans": true,
+        "nhistory_max": 200,
+        "record_amplitudes": false,
+        "clip_threshold": 5.0,
+        "clip_center": "mean",
+        "nan_safe": true,
+        "optimizer_type": "spring",
+        "optimizer": {
+            "spring": {
+                "schedule_type": "inverse_time",
+                "learning_rate": 0.005,
+                "learning_decay_rate": 0.0001,
+                "mu": 0.99,
+                "damp_schedule_type": "inverse_time",
+                "damping": 0.001,
+                "norm_constraint": 0.001
+            }
+        }
+    },
+    "eval": {
+        "nchains": 512,
+        "nburn": 40000,
+        "nepochs": 50000,
+        "repeat_single_mol": false,
+        "repeat_single_molecule_walker": 2,
+        "nsteps_per_param_update": 40,
+        "nmoves_per_width_update": 100,
+        "record_amplitudes": false,
+        "std_move": 0.25,
+        "init_width": 0.5,
+        "use_data_from_training": false,
+        "record_local_energies": true,
+        "nan_safe": false,
+        "ion_pos": [
+            [
+                [
+                    0.0,
+                    0.0,
+                    1.034
+                ],
+                [
+                    0.0,
+                    0.0,
+                    -1.034
+                ]
+            ]
+        ],
+        "ion_charges": [
+            7.0,
+            7.0
+        ],
+        "single_nspins": [
+            [
+                5,
+                2
+            ],
+            [
+                2,
+                5
+            ]
+        ],
+        "nspins": [
+            7,
+            7
+        ]
+    },
+    "wfn_type": "gaoqiao",
+    "gq": {
+        "det_mode": "det",
+        "feat_do_act": false,
+        "feat_act_func": "tanh",
+        "feat_numb_divid": 1,
+        "scale": 1.0,
+        "dp_type": "full",
+        "type": "ef_shrd_sym_ablation",
+        "envelope_type": "ds_hz_deg",
+        "ndet": 16,
+        "wfn_depth": 4,
+        "h1": 64,
+        "h2": 16,
+        "nh": 16,
+        "do_complex": false,
+        "jastrow_type": "mlp_res",
+        "jastrow_activation_type": "tanh",
+        "jastrow_mlp_nlayer": 4,
+        "jastrow_mlp_ndim": 32,
+        "rescale_input": "all",
+        "activation_type": "silu"
+    },
+    "logdir": "../results/N2_single_ablation_1",
+    "save_to_current_datetime_subfolder": false,
+    "subfolder_name": "N2_single_ablation",
+    "logging_level": "INFO",
+    "dtype": "float64",
+    "distribute": false,
+    "debug_nans": false,
+    "initial_seed": 0,
+    "base_logdir": "../results"
+}

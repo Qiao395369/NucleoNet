@@ -1,0 +1,189 @@
+{
+    "base_logdir": "../results",
+    "debug_nans": false,
+    "distribute": false,
+    "dtype": "float64",
+    "eval": {
+        "init_width": 0.5,
+        "ion_charges": [
+            6.0,
+            3.0,
+            7.0
+        ],
+        "ion_pos": [
+            [
+                [
+                    0.0,
+                    0.0,
+                    0.0
+                ],
+                [
+                    -3.968425,
+                    0.0,
+                    0.0
+                ],
+                [
+                    2.196107,
+                    0.0,
+                    0.0
+                ]
+            ]
+        ],
+        "nan_safe": false,
+        "nburn": 40000,
+        "nchains": 256,
+        "nepochs": 80000,
+        "nmoves_per_width_update": 100,
+        "nspins": [
+            8,
+            8
+        ],
+        "nsteps_per_param_update": 40,
+        "record_amplitudes": false,
+        "record_local_energies": true,
+        "repeat_single_mol": false,
+        "repeat_single_molecule_walker": 8,
+        "single_nspins": [
+            [
+                4,
+                2
+            ],
+            [
+                2,
+                1
+            ],
+            [
+                2,
+                5
+            ]
+        ],
+        "std_move": 0.25,
+        "use_data_from_training": false
+    },
+    "gq": {
+        "activation_type": "silu",
+        "det_mode": "det",
+        "do_complex": false,
+        "dp_type": "full",
+        "envelope_type": "ds_hz_deg",
+        "feat_act_func": "tanh",
+        "feat_do_act": false,
+        "feat_numb_divid": 1,
+        "h1": 128,
+        "h2": 32,
+        "jastrow_activation_type": "tanh",
+        "jastrow_mlp_ndim": 32,
+        "jastrow_mlp_nlayer": 4,
+        "jastrow_type": "mlp_res",
+        "ndet": 16,
+        "nh": 16,
+        "rescale_input": "all",
+        "scale": 1.0,
+        "type": "ef_shrd_sym",
+        "wfn_depth": 4
+    },
+    "initial_seed": 0,
+    "logdir": "../results/LiCN_single_3_2",
+    "logging_level": "INFO",
+    "notes": "default (reloaded from .//reload_restore/40000_89673.npz)",
+    "pretrain": {
+        "eps": 0.0001,
+        "hf_coeff": 1,
+        "iterations": 4000,
+        "loss_mode": "fulldet",
+        "nburn": 0,
+        "nmoves_per_width_update": 100,
+        "nsteps_per_param_update": 20,
+        "offblock_lambda": 0.0,
+        "optim": "adam"
+    },
+    "problem": {
+        "atoms_symbol": [
+            "C",
+            "Li",
+            "N"
+        ],
+        "ee_softening": 0.0,
+        "ei_softening": 0.0,
+        "ion_charges": [
+            6.0,
+            3.0,
+            7.0
+        ],
+        "ion_pos": [
+            [
+                [
+                    0.0,
+                    0.0,
+                    0.0
+                ],
+                [
+                    -3.968425,
+                    0.0,
+                    0.0
+                ],
+                [
+                    2.196107,
+                    0.0,
+                    0.0
+                ]
+            ]
+        ],
+        "nspins": [
+            8,
+            8
+        ],
+        "single_nspins": [
+            [
+                4,
+                2
+            ],
+            [
+                2,
+                1
+            ],
+            [
+                2,
+                5
+            ]
+        ]
+    },
+    "save_to_current_datetime_subfolder": false,
+    "subfolder_name": "LiCN_single_3",
+    "vmc": {
+        "acc_steps": 1,
+        "best_checkpoint_every": 10000,
+        "check_for_nans": true,
+        "checkpoint_dir": "checkpoints",
+        "checkpoint_every": 10000,
+        "checkpoint_variance_scale": 10,
+        "clip_center": "mean",
+        "clip_threshold": 5.0,
+        "fwdlap_inner_size": 12,
+        "init_width": 0.5,
+        "nan_safe": true,
+        "nburn": 4000,
+        "nchains": 4096,
+        "nepochs": 150000,
+        "nhistory_max": 200,
+        "nmoves_per_width_update": 100,
+        "nsteps_per_param_update": 40,
+        "optimizer": {
+            "spring": {
+                "damp_schedule_type": "inverse_time",
+                "damping": 0.001,
+                "learning_decay_rate": 0.0001,
+                "learning_rate": 0.005,
+                "mu": 0.99,
+                "norm_constraint": 0.001,
+                "schedule_type": "inverse_time"
+            }
+        },
+        "optimizer_type": "spring",
+        "record_amplitudes": false,
+        "repeat_single_mol": false,
+        "repeat_single_molecule_walker": 2,
+        "std_move": 0.25
+    },
+    "wfn_type": "gaoqiao"
+}

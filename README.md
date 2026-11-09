@@ -2,7 +2,16 @@
 
 NucleoNet is a JAX implementation of a nuclear-aware neural wavefunction for molecular variational Monte Carlo (VMC). It supports single-geometry optimization and joint optimization across multiple geometries of the same molecular system, using a shared electron–nucleus backbone, a multideterminant Slater–Jastrow ansatz, forward Laplacians, and the SPRING optimizer.
 
-The Python package is named `vmcnet`. The examples below define molecular coordinates directly on the command line; no external dataset is needed. Pretrained checkpoints and training trajectories are not included.
+The Python package is named `vmcnet`. This repository includes the calculation code, JSON inputs and energy summaries, and Python scripts for the numerical figures in the manuscript *NucleoNet: A Nuclear-Aware Determinant Ansatz for Multi-Geometry Neural Variational Monte Carlo*.
+
+| Path | Contents |
+| --- | --- |
+| [`config/`](config/) | Molecular coordinates and settings for HF pretraining, VMC optimization, and energy evaluation |
+| [`data/`](data/) | Per-geometry means, variances, standard errors, and integrated autocorrelation times for the reported NucleoNet energies |
+| [`figure/`](figure/) | Plotting scripts, reference values used in the plots, and PNGs for the numerical figures |
+| [`vmcnet/`](vmcnet/) | Wavefunction, sampling, optimization, and energy analysis code |
+
+The JSON inputs contain the coordinates needed to start the calculations. To redraw the numerical results, use the archived energy summaries directly. Pretrained checkpoints and raw training and evaluation trajectories are not included.
 
 ## Installation
 
@@ -26,6 +35,52 @@ python -c "import jax; print(jax.__version__); print(jax.devices())"
 ```
 
 Confirm that JAX lists a GPU before starting a full calculation. Driver and platform requirements are described in the [JAX 0.4.34 installation instructions](https://github.com/jax-ml/jax/blob/jax-v0.4.34/docs/installation.md). CPU execution is suitable for small checks; the examples below are full training configurations.
+
+## Run a manuscript configuration
+
+From the repository root, pass a JSON input to `--presets.path`. Use `--config` flags to override individual fields. For example, the following command starts the 32-geometry N₂ calculation and writes outputs under `results/`.
+
+```bash
+python -m vmcnet.train.runners \
+  --presets.path=config/N2/multi_32/config.json \
+  --config.logdir=./results
+```
+
+The configuration and data directories use corresponding benchmark names. The equilibrium N₂ and NH₃ results are under `N2/single/` and `NH3/single/`, respectively. The LiCN inputs distinguish independent runs (`LiCN/single/geometry_*`), joint training (`LiCN/multi_5/`), and endpoint-only training (`LiCN/sparse_2/`). The ethane and formamide inputs contain the 20 geometries in minimum-energy-path image order. The ablation directories identify the electron-only backbone (`EB`), nucleus-specific envelope coefficients (`NS`), or both (`EB-NS`).
+
+The N₂ sparse presets train on six geometries and evaluate those same six by default. To train on six geometries and evaluate the resulting wavefunction on the manuscript's 32-point grid from 1.6 to 6.4 bohr, use the evaluation coordinates from the full-grid preset. The 32-point evaluation uses 128 chains per geometry. You can substitute a preset from `config/N2/sparse_6_ablation/` to run an ablation on that grid.
+
+```bash
+n2_eval_positions=$(python -c 'import json; from pathlib import Path; cfg = json.loads(Path("config/N2/multi_32/config.json").read_text()); print(tuple(tuple(tuple(atom) for atom in geom) for geom in cfg["eval"]["ion_pos"]))')
+python -m vmcnet.train.runners \
+  --presets.path=config/N2/sparse_6/config.json \
+  --config.logdir=./results \
+  --config.subfolder_name=N2_sparse_6_eval_32 \
+  --config.eval.ion_pos="$n2_eval_positions" \
+  --config.eval.nchains=128
+```
+
+In the archived sparse N₂ data, `statistics6.json` contains fixed-parameter evaluations at the six training geometries and `statistics32.json` contains fixed-parameter evaluations on the 32-point grid. The output from a new run is written as `eval/statistics.json` in its run directory.
+
+## Redraw the numerical figures
+
+From the repository root, install the plotting dependencies in the environment used above, then run a plotting script. The scripts write PNGs to `figure/` and can replace the bundled images with newly rendered versions. Use a separate checkout or copy if you need to preserve the original PNGs.
+
+```bash
+python -m pip install matplotlib pandas
+MPLBACKEND=Agg python figure/generalization.py
+```
+
+| Manuscript figure | Plotting script | Inputs |
+| --- | --- | --- |
+| 2. Equilibrium energy error and parameter count | [`params_vs_energy.py`](figure/params_vs_energy.py) | Tabulated energies and parameter counts in the script |
+| 3. N₂ dissociation | [`N2.py`](figure/N2.py) | `data/N2/multi_32/`, reference curve in [`MLR.py`](figure/tools/MLR.py), and comparison values in the script |
+| 4. LiCN displacement | [`licn.py`](figure/licn.py) | `data/LiCN/single/`, `data/LiCN/multi_5/`, and comparison values in the script |
+| 5. Ethane and formamide dissociation | [`formamide_and_ethane.py`](figure/formamide_and_ethane.py) | `data/ethane/`, `data/formamide/`, comparison values in the script, and the supplied [`MEP_path.png`](figure/MEP_path.png) |
+| 6. Sparse-geometry generalization | [`generalization.py`](figure/generalization.py) | N₂ full and sparse data, LiCN single, full and sparse data, and `MLR.py` |
+| 7. N₂ ablation | [`ablation_n2_error.py`](figure/ablation_n2_error.py) | `data/N2/sparse_6/`, `data/N2/sparse_6_ablation/`, and `MLR.py` |
+
+The scripts reproduce the numerical panels from the archived inputs. Figure styling can differ from the manuscript, including annotations in the molecular illustration above the Figure 5 plots.
 
 ## Single-geometry N2
 
